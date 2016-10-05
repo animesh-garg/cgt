@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 2.6)
+cmake_minimum_required(VERSION 2.8.11)
 
 if(${CMAKE_SOURCE_DIR} STREQUAL ${CMAKE_BINARY_DIR})
   message(FATAL_ERROR "In-source builds not allowed. Please make a new directory (called a build directory) and run CMake from there.\nBut first clean the build files that just got created in the source directory:\nrm -rf CMakeFiles CMakeCache.txt")
@@ -37,7 +37,7 @@ list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/4build/cmake)
 include(${CMAKE_SOURCE_DIR}/4build/cmake/UseCython.cmake)
 include(${CMAKE_SOURCE_DIR}/4build/cmake/CUDA.cmake)
 
-find_package(PythonLibs REQUIRED)
+find_package(PythonLibs 2.7 REQUIRED)
 find_package(Numpy REQUIRED)
 
 if (APPLE)
@@ -48,6 +48,7 @@ endif()
 option(CGT_ENABLE_CUDA OFF "Enable CUDA support")
 option(CGT_ENABLE_CUDNN ON "Enable CUDNN support")
 option(CGT_DEVEL_MODE OFF "Build with more compiler errors and warnings")
+SET(CGT_MAX_CPUS "16" CACHE STRING "Max CPUs that might ever be used")
 
 message(
     "\n"
@@ -106,7 +107,7 @@ target_link_libraries(cycgt cgt)
 set(OPENBLAS_LIBRARY ${CMAKE_BINARY_DIR}/OpenBLAS/libopenblas.a)
 
 add_custom_command(
-  COMMAND 4build/download_and_build_openblas.py ${CMAKE_BINARY_DIR}/OpenBLAS
+  COMMAND 4build/download_and_build_openblas.py ${CMAKE_BINARY_DIR}/OpenBLAS ${CGT_MAX_CPUS}
   OUTPUT ${OPENBLAS_LIBRARY}
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )

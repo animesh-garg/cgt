@@ -9,7 +9,8 @@ from nose.plugins.skip import SkipTest
 
 @across_configs(precisions=("double",), backends=("native",))
 def test_cudnn():
-    if not get_compile_info()["CGT_ENABLE_CUDNN"]:
+    compile_info = get_compile_info()
+    if not (compile_info["CGT_ENABLE_CUDNN"] and compile_info["CGT_ENABLE_CUDA"]):
         raise SkipTest("CUDNN not enabled. Skipping this test")
 
     Xval = nr.randn(2,3,19,18)
@@ -33,10 +34,11 @@ def test_cudnn():
     angrads = fgrad(Xval,Wval,bval)
     nugrads = numeric_grad_multi(fcost, [Xval, Wval, bval],eps=1e-3)
     for (nugrad,angrad) in zip(nugrads,angrads):
-        assert np.allclose(nugrad, angrad)
+        assert np.allclose(nugrad, angrad, rtol=9e-3, atol=1e-7) 
+        # precision issue: https://groups.google.com/forum/?utm_medium=email&utm_source=footer#!msg/cgt-users/l59nwLF9BzM/aDxcHU5pCgAJ
 
-@across_configs(precisions=("quad",), backends=("native",))
-def test_cpu_pool(**kwargs):
+@across_configs(precisions=("double",), backends=("native",))
+def test_pool(**kwargs):
     np.random.seed(0)
     x = cgt.tensor4("x", fixed_shape=(2,3,5,7))
     y = max_pool_2d(x, (4,4),(0,0),(1,1))

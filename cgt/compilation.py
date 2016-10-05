@@ -19,9 +19,10 @@ def function(inputs, outputs, dbg=None, updates=None, givens=None):
         raise ValueError("Expected `outputs` to be a Node or a list of Nodes. Got an object of type %s"%type(outputs))
 
 def _function_listout(inputs, outputs, dbg = None, updates=None, givens=None):
+    if isinstance(updates,dict): updates=updates.items()
     if updates is None:  updates = []
     else: assert (isinstance(updates, list) and 
-                all(isinstance(a,tuple) and len(a)==2 
+        all(isinstance(a,tuple) and len(a)==2
                     and isinstance(a[0], core.Node) and isinstance(a[1], core.Node) 
                     for a in updates)), "updates should be a list of pairs (before, after)"
     if givens is None: givens = []
@@ -46,7 +47,7 @@ def determine_devices(nodes_sorted, updatetarg2src):
     # on possible devices for a node
 
     if python_only():
-        return {node:Device() for node in nodes_sorted}
+        return {node:core.Device() for node in nodes_sorted}
 
     # (1) Get available devices for nodes, determined by which impls are available and node types
     compile_info = get_compile_info()
@@ -59,19 +60,21 @@ def determine_devices(nodes_sorted, updatetarg2src):
     for node in nodes_sorted:
 
         default_device = node.props.get("default_device", home_device)
-        if node in updatetarg2src:
+        if node.is_scalar():
+            device = home_device
+        elif node in updatetarg2src:
             device = node2dev[updatetarg2src[node]]
+            assert "native_"+device.devtype in node.op.available_impls, "XXX bug: update only works if final operation can be performed on target device"
         elif node.is_data():
             device = node.op.device
         elif node.is_argument():
             device = home_device
         else:
-
-            if "native_gpu" in node.op.available_impls and (default_device.devtype == "gpu" or "native_cpu" not in node.op.available_impls):                
+            if ("native_gpu" in node.op.available_impls) and ((default_device.devtype == "gpu") or ("native_cpu" not in node.op.available_impls)):                
                 assert cuda_enabled, "trying to put op on gpu but cuda is disabled"
                 device = core.Device("gpu", default_device.idx)
             else:
-                device = core.Device(devtype="cpu", idx=default_device.idx)
+                device = core.Device(devtype="cpu", idx=default_device.idx)                
         node2dev[node] = device
 
     return node2dev
@@ -144,7 +147,7 @@ def topsorted_shapes_first(outputs, node2shape):
                 stack.append((j,0))
     return out
 
-def determine_memowner(nodes_sorted, updates, node2dev):
+def determine_memowner(nodes_sorted, updates, node2dev, outputs):
     # First determine how many "child" nodes each node has
     node2child = defaultdict(list)
     for node in nodes_sorted:
@@ -171,11 +174,14 @@ def determine_memowner(nodes_sorted, updates, node2dev):
         elif enable_inplace_opt and node.op.return_type == "byref": # TODO think about if we need any other conditions
             nodeshape = node.op.shp_apply(node.parents)
             for parent in node.parents:
+                parentowner = node2memowner[parent]
                 if (len(node2child[parent])==1
                         and nodeshape==cgt.shape(parent) # XXX not a very robust way to check
                         and node.dtype == parent.dtype
-                        and _is_data_mutable(parent)):
-                    base = parent
+                        and _is_data_mutable(parentowner)
+                        and parent not in outputs
+                        ):
+                    base = parentowner
                     break
         # TODO: add optimization for in-place incrementing
         node2memowner[node] = base
@@ -228,7 +234,6 @@ def create_execution_graph(inputs, nodes_sorted, node2shape, node2memowner, node
                             arr_locs.append(arr_loc)
                         write_loc = counter.new_memloc(node2dev[node].devtype)
                         instrs.append(BuildTup(node.typ, arr_locs, write_loc))
-
                 else:
                     # If this node writes to another node's memory, the devices must be the same
                     # this should have been enforced in determine_devices()
@@ -331,6 +336,8 @@ def run_compilation_pipeline(inputs, outputs, updates, givens):
     updatetargs_simple = outputs_updatetargs_simple[len(outputs):]
     node2dev = determine_devices(nodelist, {targ:src for (src,targ) in zip(updatesrcs, updatetargs_simple)})
     add_transports(nodelist, node2dev, analysis["node2shape"])
+    # XXX we're missing stuff used for shape computation
+    # XXX i think we might also have unnecessary stuff from shape comp in exe graph
 
     # Phase 3: build execution graph
     # ------------------------------------------------------
@@ -338,10 +345,10 @@ def run_compilation_pipeline(inputs, outputs, updates, givens):
     nodes_sorted = topsorted_shapes_first(outputs_updatetargs_simple, analysis["node2shape"]) # XXX don't need shapes for byval ops
     # For each node, figure out if its output should be written to a previous node's memory
     # (memowner : "memory owner")
-    updatetargs_simple = outputs_updatetargs_simple[len(outputs):]
-    node2memowner = determine_memowner(nodes_sorted, zip(updatesrcs, updatetargs_simple), node2dev)
-    # Find the outputs we want to return
     outputs_simple = outputs_updatetargs_simple[:len(outputs)] # get rid
+    updatetargs_simple = outputs_updatetargs_simple[len(outputs):]
+    node2memowner = determine_memowner(nodes_sorted, zip(updatesrcs, updatetargs_simple), node2dev, outputs_simple)
+    # Find the outputs we want to return
     # Generate execution graph
     eg, node2memloc = create_execution_graph(
         inputs, nodes_sorted, analysis["node2shape"], node2memowner, node2dev)
@@ -514,10 +521,15 @@ class ReturnByVal(Instr):
 # Compiling native code
 # ================================================================
 
+
+CPP_ABI_VERSION = 1 
+# every time your make changes to internal data structures in cgt_common.h, increment this number
+# to force recompilation of all shared libraries
+
 def nci2callable(nci):
     template_code = gen_templated_code(nci.includes, nci.closure_triples, nci.func_code)
     compile_info = get_compile_info()    
-    prefix = utils.hash_seq1(template_code, compile_info["CPP_FLAGS"], *(src.code for src in nci.extra_srcs))
+    prefix = utils.hash_seq1(template_code, compile_info["CPP_FLAGS"], str(CPP_ABI_VERSION), *(src.code for src in nci.extra_srcs))
     d = dict(function=_funcname(prefix), closure=_closurename(prefix),setup=_setupname(prefix),teardown=_teardownname(prefix))
     
     fn_srcfile = core.SrcFile("c++",string.Template(template_code).substitute(d))
@@ -636,11 +648,12 @@ def get_compile_info():
         CUDNN_ROOT = cmake_info["CUDNN_ROOT"]
 
 
+        cuda_library_dir = osp.join(CUDA_ROOT,"lib64") if osp.exists(osp.join(CUDA_ROOT,"lib64")) else osp.join(CUDA_ROOT,"lib")
         _COMPILE_CONFIG = dict(        
             OPENBLAS_INCLUDE_DIR = osp.join(CGT_BUILD_ROOT,"OpenBLAS"),
             CGT_INCLUDE_DIR = cmake_info["CGT_INCLUDE_DIR"],
             CGT_LIBRARY_DIR = osp.join(CGT_BUILD_ROOT,"lib"),
-            CUDA_LIBRARY_DIR = osp.join(CUDA_ROOT,"lib"),
+            CUDA_LIBRARY_DIR = cuda_library_dir,
             CUDA_INCLUDE_DIR = osp.join(CUDA_ROOT,"include"), 
             CUDA_LIBRARIES = cmake_info["CUDA_LIBRARIES"], 
             DEFINITIONS = DEFINITIONS,  
@@ -659,7 +672,8 @@ def get_compile_info():
         if _COMPILE_CONFIG["CGT_ENABLE_CUDNN"]: includes += " -I"+_COMPILE_CONFIG["CUDNN_ROOT"]
         _COMPILE_CONFIG["INCLUDES"] = includes
 
-        link_flags = "-lcgt -L"+_COMPILE_CONFIG["CGT_LIBRARY_DIR"]
+        link_flags = "-lcgt -L%s -L%s"%(_COMPILE_CONFIG["CGT_LIBRARY_DIR"], _COMPILE_CONFIG["OPENBLAS_INCLUDE_DIR"])
+        link_flags += " -Wl,-rpath,%s -Wl,-rpath,%s"%(_COMPILE_CONFIG["CGT_LIBRARY_DIR"], _COMPILE_CONFIG["OPENBLAS_INCLUDE_DIR"])
         if _COMPILE_CONFIG["CGT_ENABLE_CUDA"]: link_flags += " -L"+_COMPILE_CONFIG["CUDA_LIBRARY_DIR"]
         if _COMPILE_CONFIG["CGT_ENABLE_CUDNN"]:
             link_flags += " -L"+_COMPILE_CONFIG["CUDNN_ROOT"]
@@ -688,7 +702,7 @@ def _make_cpp_compile_cmd(srcpath):
 
 def _make_cuda_compile_cmd(srcpath):
     d = get_compile_info()
-    return "nvcc %(srcpath)s -c -o %(srcpath)s.o -ccbin cc -m64 -Xcompiler  -fPIC -Xcompiler -O3 -Xcompiler -arch -Xcompiler x86_64 %(includes)s %(definitions)s"%dict(
+    return "nvcc %(srcpath)s -c -o %(srcpath)s.o -ccbin cc -m64 -Xcompiler  -fPIC -Xcompiler -O3 %(includes)s %(definitions)s"%dict(
         srcpath = srcpath, includes=d["INCLUDES"], definitions=d["DEFINITIONS"])
 
 def _make_link_cmd(objs, extra_link_flags, libpath):
@@ -888,6 +902,6 @@ def _list_to_json(xs):
     return [x.to_json() for x in xs]
 
 def _is_data_mutable(node):
-    return not node.is_input() and not isinstance(node.op, core.Constant)
+    return not node.is_input() and node.op.return_type == "byref"
 
 

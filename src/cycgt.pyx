@@ -41,24 +41,24 @@ cdef extern from "cgt_common.h":
         cgtGPU
 
     cppclass cgtArray(cgtObject):
-        cgtArray(size_t, const size_t*, cgtDtype, cgtDevtype)
-        cgtArray(size_t, const size_t*, cgtDtype, cgtDevtype, void* fromdata, bint copy)
+        cgtArray(int, const long*, cgtDtype, cgtDevtype)
+        cgtArray(int, const long*, cgtDtype, cgtDevtype, void* fromdata, bint copy)
         int ndim() const
-        const size_t* shape() const
-        size_t size()
-        size_t nbytes() const
-        size_t stride(size_t)
+        const long* shape() const
+        long size()
+        long nbytes() const
+        long stride(int)
         cgtDtype dtype() const
         cgtDevtype devtype() const
         bint ownsdata() const
         void* data()
 
     cppclass cgtTuple(cgtObject):
-        cgtTuple(size_t)
+        cgtTuple(int)
         void setitem(int, cgtObject*)
         cgtObject* getitem(int)
-        size_t size()
-        size_t len
+        int size()
+        int len
         cgtObject** members        
 
 
@@ -79,9 +79,9 @@ cdef extern from "cgt_common.h":
     bint cgt_is_array(cgtObject*)
     bint cgt_is_tuple(cgtObject*)
 
-    void* cgt_alloc(cgtDevtype devtype, size_t)    
+    void* cgt_alloc(cgtDevtype devtype, long)    
     void cgt_free(cgtDevtype devtype, void* ptr)
-    void cgt_memcpy(cgtDevtype dest_type, cgtDevtype src_type, void* dest_ptr, void* src_ptr, size_t nbytes)
+    void cgt_memcpy(cgtDevtype dest_type, cgtDevtype src_type, void* dest_ptr, void* src_ptr, long nbytes)
 
 
 # Conversion funcs
@@ -96,7 +96,8 @@ cdef object cgt2py_object(cgtObject* o, bint view):
 
 cdef object cgt2py_array(cgtArray* a, bint view):
     cdef cnp.ndarray nparr
-    if view:
+    if view and a.devtype() == cgtCPU: 
+        # XXX won't return a view if data is on the GPU. Does any code REQUIRE output to be a view?
         return cnp.PyArray_SimpleNewFromData(a.ndim(), <cnp.npy_intp*>a.shape(), a.dtype(), a.data())
     else:
         nparr = cnp.PyArray_SimpleNew(a.ndim(), <npy_intp_t*>a.shape(), a.dtype())
@@ -112,12 +113,6 @@ cdef object cgt2py_tuple(cgtTuple* t, bint view):
     #     cpython.PyTuple_SetItem(out, i, cgt2py_object(t.getitem(i)))
     # return out
 
-cdef cnp.ndarray _to_valid_array(object arr):
-    cdef cnp.ndarray out = np.asarray(arr, order='C')
-    if not out.flags.c_contiguous: 
-        out = out.copy()
-    return out
-
 cdef bint _is_valid_array(cnp.ndarray arr):
     return arr.flags.c_contiguous
 
@@ -131,17 +126,17 @@ cdef cgtObject* py2cgt_object(object o, bint view) except *:
         # Doing a copy here could cause wrong behavior for inplace operation
             return py2cgt_arrayview(o)
         else:
-            o = _to_valid_array(o)
+            o = core.as_valid_array(o, o.dtype)
             return py2cgt_array(o, cgtCPU)
 
 cdef cgtArray* py2cgt_array(cnp.ndarray arr, cgtDevtype devtype):
-    cdef cgtArray* out = new cgtArray(arr.ndim, <size_t*>arr.shape, arr.dtype.num, devtype)
+    cdef cgtArray* out = new cgtArray(arr.ndim, <long*>arr.shape, arr.dtype.num, devtype)
     if not arr.flags.c_contiguous: arr = np.ascontiguousarray(arr)
     cgt_memcpy(out.devtype(), cgtCPU, out.data(), cnp.PyArray_DATA(arr), out.nbytes())
     return out
 
 cdef cgtArray* py2cgt_arrayview(cnp.ndarray arr):
-    cdef cgtArray* out = new cgtArray(arr.ndim, <size_t*>arr.shape, arr.dtype.num, cgtCPU, cnp.PyArray_DATA(arr), False)
+    cdef cgtArray* out = new cgtArray(arr.ndim, <long*>arr.shape, arr.dtype.num, cgtCPU, cnp.PyArray_DATA(arr), False)
     assert arr.flags.c_contiguous
     return out
 
@@ -237,8 +232,8 @@ cdef extern from "execution.h" namespace "cgt":
         ByValCallable()
     cppclass MemLocation:
         MemLocation()
-        MemLocation(size_t, cgtDevtype)
-        size_t index()
+        MemLocation(long, cgtDevtype)
+        long index()
         cgtDevtype devtype()
     cppclass Instruction:
         pass
@@ -261,20 +256,20 @@ cdef extern from "execution.h" namespace "cgt":
 
     Interpreter* create_interpreter(ExecutionGraph*, vector[MemLocation], int)
 
-cdef vector[size_t] _tovectorlong(object xs):
-    cdef vector[size_t] out = vector[size_t]()
-    for x in xs: out.push_back(<size_t>x)
+cdef vector[long] _tovectorlong(object xs):
+    cdef vector[long] out = vector[long]()
+    for x in xs: out.push_back(<long>x)
     return out
 
 cdef void* _getstructptr(object o) except NULL: # XXX except NULL causes unnecessary exception check
     if o is None: 
         return NULL
     else: 
-        return <void*><size_t>ctypes.cast(ctypes.pointer(o), ctypes.c_voidp).value    
+        return <void*><long>ctypes.cast(ctypes.pointer(o), ctypes.c_voidp).value    
     # XXX be more careful about what's coming into this fn
 
 cdef void* _getfuncptr(object o) except NULL:
-    cdef void* out= <void*><size_t>ctypes.cast(o, ctypes.c_void_p).value
+    cdef void* out= <void*><long>ctypes.cast(o, ctypes.c_void_p).value
     assert out != NULL
     return out
 
@@ -332,7 +327,7 @@ cdef ByValCallable _tocppbyvalcallable(callable, storage) except *:
         return ByValCallable(&_pyfunc_byval, <PyObject*>py_cldata)
 
 cdef MemLocation _tocppmem(object pymem):
-    return MemLocation(<size_t>pymem.index, devtype_fromstr(pymem.devtype))
+    return MemLocation(<long>pymem.index, devtype_fromstr(pymem.devtype))
 
 cdef vector[MemLocation] _tocppmemvec(object pymemlist) except *:
     cdef vector[MemLocation] out = vector[MemLocation]()
@@ -359,7 +354,8 @@ cdef Instruction* _tocppinstr(object pyinstr, object storage) except *:
     return out
 
 def _isquick(pyinstr):
-    return all(isinstance(t, core.TensorType) and t.ndim == 0 for t in pyinstr.input_types) or isinstance(pyinstr.op, (core.Constant, core.Size))
+    return all(isinstance(t, core.TensorType) and t.ndim == 0 for t in pyinstr.input_types) \
+        or isinstance(pyinstr.op, (core.Constant, core.Size, core.Reshape, core.MakeTuple, core.TupleIndex))
 
 ################################################################
 ### Wrapper classes
@@ -390,7 +386,7 @@ cdef class CppArrayWrapper:
         return self.arr.get().ndim()
     @property
     def shape(self):
-        return [self.arr.get().shape()[i] for i in range(self.arr.get().ndim())]
+        return tuple([self.arr.get().shape()[i] for i in range(self.arr.get().ndim())])
     @property
     def size(self):
         return self.arr.get().size()
@@ -399,10 +395,10 @@ cdef class CppArrayWrapper:
         return dtype_tostr(self.arr.get().dtype())
     @property
     def ptr(self):
-        return <size_t>self.arr.get()
+        return <long>self.arr.get()
     @property
     def data(self):
-        return <size_t>self.arr.get().data()
+        return <long>self.arr.get().data()
 
 
 cdef class CppInterpreterWrapper:

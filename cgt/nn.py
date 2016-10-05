@@ -1,14 +1,14 @@
-__doc__ = """
+"""
 Neural network library, drawing inspiration from Torch's nn and nngraph
 """
 
 import cgt
-from cgt import core, size
+from cgt import core
 import numpy as np
 from .nn_ops.im2col import im2col
-from .nn_ops.max_pool_2d import max_pool_2d #pylint: disable=W0611
 from .nn_ops.cross_channel_lrn import cross_channel_lrn #pylint: disable=W0611
 from .nn_ops import cudnn_ops #pylint: disable=W0611
+from .nn_ops.max_pool_2d import MaxPool
 from collections import namedtuple
 
 class Module(object):
@@ -77,26 +77,38 @@ def dropout(x, p=0):
         x = x /(1.0-p)
         return x
 
-def conv2d_fft(x_BKRC, f_LKrc, subsample, pad):
-    # TODO add shape assertion
-    f_LKrc = cgt.flip(f_LKrc, [2,3])
-    padnrows = size(x_BKRC, 2) + size(f_LKrc, 2) - 1
-    padncols = size(x_BKRC, 3) + size(f_LKrc, 3) - 1
-    tx = cgt.rfft(x_BKRC, (padnrows,padncols), (2,3))
-    tf = cgt.rfft(f_LKrc, (padnrows,padncols), (2,3))
-    out = cgt.irfft( cgt.einsum("BKrc,LKrc->BLrc",tx, tf), (2,3))
-    out = out[:,:,pad[0]:(padnrows-pad[0]):subsample[0],pad[1]:(padncols-pad[1]):subsample[1]] #pylint: disable=E1127
-    return out
+
+# ================================================================
+# Image processing functions
+# ================================================================
+
+PoolInfo = namedtuple("PoolInfo", ["kernel_h", "kernel_w", "pad_h", "pad_w", "stride_h", "stride_w"])
 
 def conv2d(x_BKRC, f_LKrc, kernelshape, pad=(0,0), stride=(1,1)):
-    col_BmnZ = im2col(x_BKRC, kernelshape, pad, stride)
+    devtype = cgt.get_config()["default_device"].devtype
     L,K,r,c = f_LKrc.shape
-    f_LZ = f_LKrc.reshape([L, K*r*c])
-    B,m,n,Z = col_BmnZ.shape
-    col_Bmn_Z = col_BmnZ.reshape([B*m*n, Z])
-    col_Bmn_L = core.Result(core.Mul22(False,True), [col_Bmn_Z, f_LZ])
-    return col_Bmn_L.reshape([B,m,n,L]).transpose([0,3,1,2])
+    if devtype == "gpu":        
+        b_1K11 = cgt.zeros((1,L,1,1), cgt.floatX)
+        return core.Result(cudnn_ops.CudnnConvForward(pad[0],pad[1],stride[0],stride[1]), [x_BKRC, f_LKrc, b_1K11])
+    else:
+        assert devtype == "cpu"
+        col_BmnZ = im2col(x_BKRC, kernelshape, pad, stride)
+        f_LZ = f_LKrc.reshape([L, K*r*c])
+        B,m,n,Z = col_BmnZ.shape
+        col_Bmn_Z = col_BmnZ.reshape([B*m*n, Z])
+        col_Bmn_L = core.Result(core.Mul22(False,True), [col_Bmn_Z, f_LZ])
+        return col_Bmn_L.reshape([B,m,n,L]).transpose([0,3,1,2])
 
+def max_pool_2d(x, kernelshape, pad = (0,0), stride=(1,1)):
+    devtype = cgt.get_config()["default_device"].devtype
+    kernel_h, kernel_w = kernelshape
+    pad_h, pad_w = pad
+    stride_h, stride_w = stride
+    info = PoolInfo(kernel_h, kernel_w, pad_h, pad_w, stride_h, stride_w)
+    if devtype == "gpu":        
+        return core.Result(cudnn_ops.CudnnPoolForward(info), [x])
+    else:
+        return core.Result(MaxPool(info), [x])[0]
 
 # ================================================================
 # Initializations
@@ -143,7 +155,7 @@ def init_array(init, shape):
 
 
 def get_xavier_weight(init, shape):
-    """For relu activation scale (init.scale) should be sqrt(2). For sigmoid and tanh 1.0 should be used.
+    r"""For relu activation scale (init.scale) should be sqrt(2). For sigmoid and tanh 1.0 should be used.
            Math depends on chosen underlying distribution (Normal, Uniform, etc) and activation function.
            For uniform with RELU you obtain
            a = sqrt{frac{6}{fan_{in}+fan_{out}}
@@ -235,10 +247,10 @@ def sgd(cost, params, learning_rate):
     params : a list of cgt shared variables. We generate update
             expressions w.r.t. these variables.
     learning_rate : float
-        Tunes the size of the update step.
+
     Returns
     -------
-    list of tuples of the form (param, updates)
+    list of tuples of the form (param, new_param)
     """
     updates = []
     grads = cgt.grad(cost, params)
@@ -248,10 +260,10 @@ def sgd(cost, params, learning_rate):
     return updates
 
 
-def momentum(cost, params, learning_rate, momentum=0.9):
+def momentum(cost, params, learning_rate, mu=0.9):
     """Stochastic Gradient Descent (SGD) updates with momentum
     Math:
-    * ``velocity := momentum * velocity - learning_rate * grad``
+    * ``velocity := mu * velocity - learning_rate * grad``
     * ``param := param + velocity``
     Parameters
     ----------
@@ -262,28 +274,34 @@ def momentum(cost, params, learning_rate, momentum=0.9):
         Tunes the size of the update step.
     momentum: float
         Tunes the weight given to the velocity term.
+    
     Returns
     -------
-    list of tuples of the form [(param, updates) (velocity, velocity_update)]
+    list of tuples of the form (param, new_param) and (velocity, new_velocity)
     """
     updates = []
     grads = cgt.grad(cost, params)
     for param, grad in zip(params, grads):
-        value = param.op.get_value()
-        velocity = cgt.shared(np.zeros(value.shape, dtype=value.dtype))
-        x = momentum * velocity + param - learning_rate * grad
-        updates.append((velocity, x-param))
-        updates.append((param, x))
+        assert isinstance(param.op, core.GetData)
+        velocity = cgt.shared(np.zeros(param.op.get_shape(), dtype=param.dtype))
+        new_velocity = mu * velocity - learning_rate * grad
+        new_param = param + new_velocity
+        updates.append((velocity, new_velocity))
+        updates.append((param, new_param))
 
     return updates
 
 
-def nesterov_momentum(cost, params, learning_rate, momentum=0.9):
+def nesterov_momentum(cost, params, learning_rate, mu=0.9):
     """Stochastic Gradient Descent (SGD) updates with Nesterov momentum
 
     Math:
-    * ``velocity := momentum * velocity - learning_rate * grad``
-    * ``param := momentum*velocity + param - learning_rate * grad``
+    * ``new_velocity := mu * velocity - learning_rate * grad``
+    * ``param := param - mu * velocity + (1 + mu) * new_velocity``
+
+    See http://arxiv.org/abs/1212.0901v2, first part of eq 7
+    At each step we're returning the "peaked-ahead parameters"
+
 
     Parameters
     ----------
@@ -292,22 +310,23 @@ def nesterov_momentum(cost, params, learning_rate, momentum=0.9):
             expressions w.r.t. these variables.
     learning_rate : float
         Tunes the size of the update step.
-    momentum: float
+    mu: float
         Tunes the weight given to the velocity term.
 
     Returns
     -------
-    list of tuples of the form [(param, updates) (velocity, velocity_update)]
+    list of tuples of the form (param, updates), (velocity, velocity_update)
     """
     updates = []
     grads = cgt.grad(cost, params)
 
     for param, grad in zip(params, grads):
-        value = param.op.get_value()
-        velocity = cgt.shared(np.zeros(value.shape, dtype=value.dtype))
-        x = momentum * velocity - learning_rate * grad
-        updates.append((velocity, x))
-        updates.append((param, momentum*x + param - learning_rate * grad))
+        assert isinstance(param.op, core.GetData)
+        velocity = cgt.shared(np.zeros(param.op.get_shape(), dtype=param.dtype))
+        new_velocity = mu * velocity - learning_rate * grad
+        new_param = param - mu * velocity + (mu + 1) * new_velocity
+        updates.append((velocity, new_velocity))
+        updates.append((param, new_param))
 
     return updates
 
@@ -344,8 +363,8 @@ def adagrad(cost, params, learning_rate=1.0, epsilon=1e-6):
     grads = cgt.grad(cost, params)
 
     for param, grad in zip(params, grads):
-        value = param.op.get_value()
-        accu = cgt.shared(np.zeros(value.shape, dtype=value.dtype))
+        assert isinstance(param.op, core.GetData)
+        accu = cgt.shared(np.zeros(param.op.get_shape(), dtype=param.dtype))
         accu_new = accu + grad ** 2
         updates.append((accu, accu_new))
         updates.append((param, param - (learning_rate * grad) / cgt.sqrt(accu_new + epsilon)))
@@ -375,7 +394,7 @@ def rmsprop(cost, params, learning_rate=1.0, rho=0.9, epsilon=1e-6):
 
     Returns
     -------
-    list of tuples of the form [(param, updates), (accumulated_RMS_grads, accumulated_RMS_grads_new)]
+    list of tuples of the form (param, updates), (accumulated_RMS_grads, accumulated_RMS_grads_new)
 
     References
     ----------
@@ -388,8 +407,8 @@ def rmsprop(cost, params, learning_rate=1.0, rho=0.9, epsilon=1e-6):
     grads = cgt.grad(cost, params)
 
     for param, grad in zip(params, grads):
-        value = param.op.get_value()
-        accu = cgt.shared(np.zeros(value.shape, dtype=value.dtype))
+        assert isinstance(param.op, core.GetData)
+        accu = cgt.shared(np.zeros(param.op.get_shape(), dtype=param.dtype))
         accu_new = rho * accu + (1 - rho) * grad ** 2
         updates.append((accu, accu_new))
         updates.append((param, param - (learning_rate * grad / cgt.sqrt(accu_new + epsilon))))
@@ -422,7 +441,7 @@ def adadelta(cost, params, learning_rate=1.0, rho=0.95, epsilon=1e-6):
     Returns
     -------
     list of tuples of the form
-    [(param, updates), (accumulated_grads, accumulated_grads_new), (step_accum, step_accum_new)]
+    (param, updates), (accumulated_grads, accumulated_grads_new), (step_accum, step_accum_new)
 
     References
     ----------
@@ -434,9 +453,9 @@ def adadelta(cost, params, learning_rate=1.0, rho=0.95, epsilon=1e-6):
     grads = cgt.grad(cost, params)
 
     for param, grad in zip(params, grads):
-        value = param.op.get_value()
-        accu = cgt.shared(np.zeros(value.shape, dtype=value.dtype))
-        delta_accu = cgt.shared(np.zeros(value.shape, dtype=value.dtype))
+        assert isinstance(param.op, core.GetData)
+        accu = cgt.shared(np.zeros(param.op.get_shape(), dtype=param.dtype))
+        delta_accu = cgt.shared(np.zeros(param.op.get_shape(), dtype=param.dtype))
 
         accu_new = rho * accu + (1 - rho) * grad ** 2
         updates.append((accu, accu_new))

@@ -44,7 +44,7 @@ tensor4.__doc__ = _tensor_doc_template%("4-tensor",4)
 
 def tensor(dtype, ndim, name=None, fixed_shape=None):
     return core.Argument(core.TensorType(cgt.floatX if dtype is None else dtype, ndim), name, fixed_shape=fixed_shape)
-scalar.__doc__ = _tensor_doc_template%("k-tensor","k")
+tensor.__doc__ = _tensor_doc_template%("k-tensor","k")
 
 # ================================================================
 # Symbolic functions
@@ -139,7 +139,7 @@ def cast(x, dtype):
         diff = (core.dtype_kind(dtype) in 'cf')
         opname = 'cast_to_%s' % dtype
         ui = core.UnaryInfo(opname, _get_nu_cast(dtype), diff, dtype,  
-            lambda x,y,gy : (cast(gy, x.dtype) if diff else core._nondiff()), 'x')
+            lambda x,y,gy : cast(gy, x.dtype) if diff else None, 'x')
         return core.Result(core.ElwiseUnary(opname, ui), [x])
 
 def ceil_divide(x, y):
@@ -190,6 +190,18 @@ def dot(x, y):
             raise NotImplementedError
     else:
         raise NotImplementedError
+
+def diag(v, k=0):
+    """
+    see numpy.diag
+    """
+    assert isinstance(k, int)
+    assert v.ndim == 1
+    n = size(v,0)+abs(k)
+    out = cgt.zeros((n,n), v.dtype)
+    out = inc_subtensor(out, (cgt.arange(n), cgt.arange(n)+k), v)
+    return out
+
 
 def einsum(desc, x, y):
     """
@@ -268,86 +280,170 @@ def floor_divide(x, y):
     """
     return ifloor(x / y)
 
-def getitem(arr, slis):
-    """
-    Used internally for array indexing/slicing, though we will specify it's behavior later
-    """
-    arr = core.as_node(arr)
-    if isinstance(arr.typ, core.TupleType):
-        assert isinstance(slis, int)
-        return tuple_index(arr, slis)
-    if (not _is_list_or_tuple(slis)):
-        slis = [slis]
-    if all(isinstance(sli, (int, slice, type(None))) for sli in slis):
-        return getitem_nonfancy(arr, slis)
-    elif all((isinstance(sli, (np.ndarray, core.Node)) for sli in slis)):
-        return getitem_fancy(arr, slis)
-    else:
-        raise ValueError('Tried to index with slices %s. Either all should be in {slice,int,colon} or all must be a ndarray of ints' % str(slis))
 
-def getitem_fancy(arr, indarrs):
-    """
-    Used internally for fancy indexing
-    """
-    assert all(((indarr.ndim == 1) for indarr in indarrs))
-    indarrs = map(core.as_node, indarrs)
-    flatinds = sub2ind(indarrs, shape(arr))
-    return core.Result(core.GetFlatIndices(), [arr, flatinds])
+def _iscolon(sli):
+    return isinstance(sli, slice) and sli.start is None and sli.stop is None and sli.step is None
 
-def getitem_nonfancy(arr, slis):
-    """
-    Used internally for slicing
-    """
-    out = arr
-    ax = 0
-    shapedesc = []
-    if (not _is_list_or_tuple(slis)):
-        slis = [slis]
-    for sli in slis:
-        if isinstance(sli, slice) and all(x is None for x in (sli.start, sli.stop, sli.step)):
-            shapedesc.append(ax)
-        elif (sli is None):
-            shapedesc.append('+')
-            ax -= 1
-        elif isinstance(sli, bool):
-            raise ValueError('tried to index with a bool')
-        else:
-            if isinstance(sli, slice):
-                shapedesc.append('k')
-            elif isinstance(sli, int):
-                sli = slice(sli, sli + 1, 1)
-                shapedesc.append('-')
-            else:
-                raise NotImplementedError
-            start = (0 if sli.start is None else sli.start)
-            stop = size(arr, ax) if (sli.stop is None) else sli.stop
-            step = (1 if sli.step is None else sli.step)
-            if (isinstance(stop, int) and (stop < 0)):
-                stop = size(arr, ax) - stop
-            if isinstance(step, int):
-                assert step != 0
-                if step < 0:
-                    raise NotImplementedError("negative `step parameter is not implemented. use flip(x,0) instead of x[::-1]")
 
-            out = core.Result(core.GetSli(ax), [out, start, stop, step])
-        ax += 1
-    if all(((x == 'k') for x in shapedesc)):
+def subtensor(x, slis):
+    """
+    Index or slice array `x` with the sequence of slices `slis`
+    Corresponds to the numpy code x[slis]
+
+    x : cgt.Node or ndarray
+    slis : list of slices, which is one of the following format:
+
+    1. sequence of ":" or None
+    2. sequence of ":", slice, or int
+    3. sequence of intarray of length x.ndim
+    4. sequence of intarray or ":", with a single intarray
+
+    where intarray denotes either an
+    - cgt node with ndim=1 and dtype=int
+    - numpy ndarray with ndim=1 and dtype=int
+
+    """
+    return _subtensor(x, slis)
+
+def inc_subtensor(x, slis, y):
+    """
+    Returns the array that is obtained by incrementing x[slis] by y
+    This function corresponds to the following numpy code:
+        out = x.copy()
+        out[slis] += y
         return out
+    Note that due to an in-place optimization, the copy operation is
+    usually not performed.
+
+    See subtensor docstring for a list of appropriate formats for `slis`
+    Only formats 2-4 are allowed for inc_subtensor
+    """
+    return _subtensor(x, slis, y)
+
+def _subtensor(x, slis, y=None):
+    """
+    To reduce code duplication, we use the same underlying function for
+    subtensor and inc_subtensor
+    if y is None, we're just slicing
+    otherwise, we're incrementing the slice
+    """
+
+    x = core.as_node(x)
+    if y is not None: y = core.as_node(y)
+    assert x.is_tensor()
+
+    # Make sure slis is an int
+    if not isinstance(slis, (list, tuple)):
+        slis = [slis]
     else:
-        axidx = 0
-        newshape = []
-        for d in shapedesc:
-            if (d == '+'):
-                newshape.append(1)
-            elif (d == '-'):
-                axidx += 1
+        slis = list(slis)
+
+
+    # Case 1. (see subtensor docstring)
+    if all(_iscolon(sli) or sli is None  for sli in slis):
+        assert y is None
+        return _subtensor1(x, slis)
+    # Case 2.
+    elif all(_iscolon(sli) or isinstance(sli, slice) or _is_int_scalar(sli) for sli in slis):
+        if y is not None:
+            # check that slice is only along one axis:
+            assert np.sum([not _iscolon(sli) for sli in slis])==1, "currently can only increment subtensor involving a slice along one axis"
+        return _subtensor2(x, slis, y)
+    # Case 3.
+    elif len(slis) == x.ndim and all(_is1dintarray(sli) for sli in slis):
+        return _subtensor3(x, slis, y)
+    # Case 4.
+    elif all(_is1dintarray(sli) or _iscolon(sli) for sli in slis) and np.sum([_is1dintarray(sli) for sli in slis])==1:        
+        return _subtensor4(x, slis, y)
+    else:
+        raise ValueError('Tried to index with slices %s. See cgt.subtensor docstring for description of valid indexing expressions'%slis)
+
+def _is_int_scalar(x):
+    return isinstance(x,int) \
+            or np.isscalar(x) and x.dtype.kind=='i' \
+            or (isinstance(x, core.Node) and x.ndim == 0 and core.dtype_kind(x.dtype)=='i')
+     
+def _subtensor1(x, slis):
+
+    axidx = 0 # number of axes from x matched to ":"s so far
+    newshape = []
+
+    for sli in slis:
+        if _iscolon(sli):
+            newshape.append(size(x, axidx))
+            axidx += 1
+        else:
+            assert sli is None
+            newshape.append(1)
+
+    return x.reshape(newshape)
+
+def _subtensor2(x, slis, y):
+
+    dims2drop = []
+    for (ax,sli) in enumerate(slis):
+        if _is_int_scalar(sli):
+            if y is None:
+                dims2drop.append(ax)
             else:
-                newshape.append(size(out, axidx))
-                axidx += 1
-        for axidx in xrange(axidx, out.ndim):
-            newshape.append(size(out, axidx))
-        out = reshape(out, newshape)
-    return out
+                yshape = cgt.shape(y)
+                yshape.insert(ax, 1)
+                y = y.reshape(yshape)
+            sli = slice(sli, sli + 1, 1)
+
+        assert isinstance(sli.step, int) or sli.step is None
+        step = 1 if sli.step is None else sli.step
+
+        if step < 0:
+            start = size(x, ax)-1 if sli.start is None else sli.start
+            stop = -1 if sli.stop is None else sli.stop
+        else:
+            start = 0 if sli.start is None else sli.start
+            stop = size(x, ax) if sli.stop is None else sli.stop
+
+        assert isinstance(step, (int, core.Node)), "step argument of a slice should be an integer or a symbolic variable"
+
+        if y is None:
+            x = core.Result(core.GetSli(ax), [x, start, stop, step])
+        else:
+            # note: we only support incrementing slice along one axis
+            return core.Result(core.IncSli(ax), [x, start, stop, step, y])
+
+    x = _dropdims(x, dims2drop)
+    return x
+
+def _subtensor3(x, slis, y):
+    """
+    Index x with x.ndim arrays of int.
+    """
+    assert all(((indarr.ndim == 1) for indarr in slis))
+    slis = map(core.as_node, slis)
+    flatinds = sub2ind(slis, shape(x))
+    if y is None:
+        return core.Result(core.GetFlatIndices(), [x, flatinds])
+    else:
+        return core.Result(core.IncFlatIndices(), [x, flatinds, y])
+
+def _subtensor4(x, slis, y):
+    for (ax,sli) in enumerate(slis):
+        if _is1dintarray(sli):
+            if y is None:
+                return core.Result(core.GetFancySli(ax), [x, sli])
+            else:
+                return core.Result(core.IncFancySli(ax), [x, sli, y])
+    assert 0, "should be unreachable"
+
+
+
+
+def _is1dintarray(x):
+    if isinstance(x, core.Node) and x.ndim == 1 and core.dtype_kind(x.dtype)=='i':
+        return True
+    elif isinstance(x, np.ndarray) and x.ndim == 1 and x.dtype.kind == 'i':
+        return True
+    else:
+        return False
+
 
 def irfft(x, axes):
     """
@@ -498,11 +594,11 @@ def shape(x):
     else:
         return tuple(map(shape, x.parents))
 
-def shared(val, name=None, device=None, fixed_shape_mask=None):
+def shared(value, name=None, device=None, fixed_shape_mask=None):
     """
     Creates a variable that has an underlying data value, which can be changed externally
     """
-    op = core.InMemoryData(val, device=device,fixed_shape_mask=fixed_shape_mask)
+    op = core.InMemoryData(value, device=device,fixed_shape_mask=fixed_shape_mask)
     return core.Result(op, [], name=name)
 
 def size(x, axis):
@@ -511,13 +607,25 @@ def size(x, axis):
     """
     return core.Result(core.Size(axis), [x])
 
-def stack(scalars):
+def stack(tensors, axis=0):
     """
-    scalars : a list of scalar variables
-    stack([a,b,c]) builds a vector with a,b,c as its elements
+    Take a sequence of tensors and stack them on given axis to make a single
+    tensor. The size in dimension `axis` of the result will be equal to the number
+    of tensors passed.
+
+    tensors : a list of tensor or scalar variables with the same shape
+    along all axes
+    axis : an int specifying the index of the new axis, default value is 0
+
+    If a, b, c have shape (2, 2, 2) then stack([a,b,c], axis=0) builds
+    a tensor with shape (3, 2, 2, 2) and stack([a,b,c], axis=1) builds
+    a tensor with shape (2, 3, 2, 2)
     """
-    assert (len(scalars) > 0) and all(s.ndim == 0 for s in scalars)
-    return core.Result(core.Stack(), scalars)
+    assert (len(tensors) > 0)
+    assert 0 <= axis and axis <= tensors[0].ndim
+    shp = shape(tensors[0])
+    newshp = shp[:axis] + [1] + shp[axis:]
+    return concatenate([reshape(t, newshp) for t in tensors], axis=axis)
 
 def sub2ind(subs, shp):
     """
@@ -567,6 +675,35 @@ def transpose(arr, axes=None):
         return arr
     else:
         return core.Result(core.Transpose(axes), [arr])
+
+def to_one_hot(y, nb_class, dtype=None):
+    """
+    Return a matrix where each row corresponds to the one hot
+    encoding of each element in y.
+    Parameters
+    ----------
+    y
+        A vector of integer value between 0 and nb_class - 1.
+    nb_class : int
+        The number of classes in y.
+    dtype : data-type
+        The dtype of the returned matrix. Default floatX.
+    Returns
+    -------
+    object
+        A matrix of shape (y.shape[0], nb_class), where each row ``i`` is
+        the one hot encoding of the corresponding ``y[i]`` value.
+    """
+    
+    fill_vals = cgt.ones((y.shape[0],))
+    ret = cgt.zeros((y.shape[0], nb_class), dtype)
+    
+    d1 = cgt.arange(y.shape[0])
+    d2 = cgt.cast(y, 'i1')
+    
+    ret = cgt.inc_subtensor(ret, [d1, d2], fill_vals)
+    
+    return ret
 
 def tuple_index(x, i):
     """

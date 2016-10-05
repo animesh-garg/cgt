@@ -10,7 +10,7 @@ Along with range of elements [low, high]
 Mprev_bnm:          previous memory state. [-inf, inf]
 X_bk:               external inputs. [0,1]
 wprev_bHn:          previous weights (read & write). [0, 1]. Normalized along axis 2.
-rprev_bhm:          previous vector read from memory. [-1, 1]
+rprev_bhm:          previous vector read from memory. [-inf, inf]
 k_bHm:              key vectors [-1, 1]
 beta_bH:            key strength [0, infinity]
 g_bH:               gating for weight update.  [0, 1]
@@ -275,6 +275,57 @@ class CopyTask(object):
     def total_time(self):
         return 2*self.t+2
 
+class ReverseCopyTask(object):
+    def __init__(self, batch_size, seq_length, output_dim):
+        self.b = batch_size
+        self.t = seq_length
+        self.k = output_dim+2
+        self.p = output_dim
+    def gen_batch(self):
+        assert self.k == self.p + 2
+        x_tbk = np.zeros((2*self.t + 2, self.b, self.k),cgt.floatX)
+        x_tbk[0, :, 0] = 1 # start symbol
+        message = (nr.rand(self.t, self.b, self.p) > .5).astype(cgt.floatX)
+        # message = (nr.rand(self.t, self.b, self.p)).astype(cgt.floatX)
+
+        x_tbk[1:self.t+1,:,2:] = message
+        x_tbk[self.t+1, :, 1] = 1 # end symbol
+        y_tbk = np.zeros((2*self.t+2, self.b, self.p),cgt.floatX)
+        y_tbk[self.t+2:] = message[::-1] # desired output
+
+        return x_tbk, y_tbk
+    def loss_timesteps(self):
+        return range(self.t+1, 2*self.t+2)
+    def total_time(self):
+        return 2*self.t+2
+
+class RepeatCopyTask(object):
+    def __init__(self, batch_size, seq_length, output_dim, n_copies):
+        self.b = batch_size
+        self.t = seq_length
+        self.k = output_dim+2
+        self.p = output_dim
+        self.n_copies = n_copies
+    def gen_batch(self):
+        assert self.k == self.p + 2
+        x_tbk = np.zeros(((1+self.n_copies)*self.t + 2, self.b, self.k),cgt.floatX)
+        x_tbk[0, :, 0] = 1 # start symbol
+        message = (nr.rand(self.t, self.b, self.p) > .5).astype(cgt.floatX)
+        # message = (nr.rand(self.t, self.b, self.p)).astype(cgt.floatX)
+
+        x_tbk[1:self.t+1,:,2:] = message
+        x_tbk[self.t+1, :, 1] = 1 # end symbol
+        y_tbk = np.zeros(((1 + self.n_copies)*self.t+2, self.b, self.p),cgt.floatX)
+        for i in xrange(self.n_copies):
+            start=self.t+2+i*self.t
+            y_tbk[start:start+self.t] = message # desired output
+        return x_tbk, y_tbk
+    def loss_timesteps(self):
+        return range(self.t+1, 2*self.t+2)
+    def total_time(self):
+        return 2*self.t+2        
+
+
 def circ_conv_1d(wg_bhn, s_bh3, axis=2):
     "VERY inefficient way to implement circular convolution for the special case of filter size 3"
     assert axis == 2
@@ -320,6 +371,7 @@ def main():
     parser.add_argument("--n_batches",type=int,default=1000000)
     parser.add_argument("--profile",action="store_true")
     parser.add_argument("--unittest", action="store_true")
+    parser.add_argument("--task",choices=["copy","reverse_copy","repeat_copy"],default="copy")
     args = parser.parse_args()
     np.seterr("raise")
 
@@ -361,7 +413,15 @@ def main():
 
     tstart = time.time()
     ntm = make_ntm(opt)
-    task = CopyTask(opt.b, seq_length, opt.p)
+    if args.task == "copy":
+        task = CopyTask(opt.b, seq_length, opt.p)
+    elif args.task == "reverse_copy":
+        task = ReverseCopyTask(opt.b, seq_length, opt.p)
+    elif args.task == "repeat_copy":
+        n_copies = 4
+        task = RepeatCopyTask(opt.b, seq_length, opt.p, n_copies)
+
+
     f_loss, f_loss_and_grad, params = make_funcs(opt, ntm, task.total_time(), task.loss_timesteps())
     print "graph construction and compilation took %g seconds"%(time.time()-tstart)
 

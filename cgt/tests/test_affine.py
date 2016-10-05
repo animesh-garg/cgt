@@ -180,7 +180,7 @@ def max1(X):
 def max2(X):
     return sum(max(X*1e4,1))
 
-def fancysli0(X):
+def flatfancysli0(X):
     return sum(X[np.array([1,0]),np.array([0,1])])
     
 def xm1(x):
@@ -251,6 +251,18 @@ def negsli1(x,y):
 def negsli01(x,y):
     return (x[::-1, ::-1]*y).sum()
 
+def fancysli0(x, y):
+    inds = np.array([0,0,1,0,1])
+    return (x[inds]*y).sum()
+
+def fancysli0a(x, y):
+    inds = np.array([0,0,1,0,1])
+    return (x[inds,:]*y).sum()
+
+def fancysli1(x, y):
+    inds = np.array([0,0,1,0,1])
+    return (x[:, inds]*y).sum()
+
 
 def convlike(F_abcd, y_e_bcd, q_ae):
     a,b,c,d = F_abcd.shape
@@ -262,13 +274,35 @@ def convlike(F_abcd, y_e_bcd, q_ae):
         P_ae = F_a_bcd.dot(y_e_bcd.T)
     return (P_ae*q_ae).sum()
 
+def diag(x, y):
+    if isinstance(x, np.ndarray):
+        return (np.diag(x)*y).sum()
+    else:
+        return (cgt.diag(x)*y).sum()
+
+
+def inc_vec(M,x, Y):
+    if isinstance(M, np.ndarray):
+        M1 = M.copy()
+        M1[0] += x
+    else:
+        M1 = cgt.inc_subtensor(M, 0, x)
+    return (M1*Y).sum()
+
+def inc_row(M,x, Y):
+    if isinstance(M, np.ndarray):
+        M1 = M.copy()
+        M1[0:1] += x
+    else:
+        M1 = cgt.inc_subtensor(M, slice(0,1), x)
+    return (M1*Y).sum()
+
 
 ################################################################
 ### Tests 
 ################################################################
 
-
-@across_configs(backends=("python", "native"), precisions=("double",))
+@across_configs(backends=("python","native"), precisions=("double",))
 def test_affine():
     np.random.seed(0)
 
@@ -294,7 +328,7 @@ def test_affine():
     check_affine(max0, mA)
     check_affine(max1, mA)
     check_affine(max2, mA)
-    check_affine(fancysli0, mA)
+    check_affine(flatfancysli0, mA)
     check_affine(sum10, mA)
     check_affine(sum01, mA)
     check_affine(repeat0, mA[0:1, :], nr.randn(7,3))
@@ -303,10 +337,11 @@ def test_affine():
     M23 = mA
     M35 = nr.randn(3,5)
     v3 = nr.randn(3)
-    v13 = v3.reshape(1,3) #XXX
+    v13 = v3.reshape(1,3)
     v5 = nr.randn(5)
-    v15 = v5.reshape(1,5) #XXX
+    v15 = v5.reshape(1,5)
     v3b = nr.randn(3)
+
 
     check_affine(matmat00, M23, M35)
     check_affine(matmat01, M23, M35.T)
@@ -342,12 +377,24 @@ def test_affine():
     check_affine(flip0, M23, nr.randn(2,3))
     check_affine(flip1, M23, nr.randn(2,3))
 
-    # check_affine(negsli0, M23, nr.randn(2,3))
-    # check_affine(negsli1, M23, nr.randn(2,3))
-    # check_affine(negsli01, M23, nr.randn(2,3))
+    check_affine(negsli0, M23, nr.randn(2,3))
+    check_affine(negsli1, M23, nr.randn(2,3))
+    check_affine(negsli01, M23, nr.randn(2,3))
+
+    check_affine(fancysli0, M23, nr.randn(5,3))
+    check_affine(fancysli0a, M23, nr.randn(5,3))
+    check_affine(fancysli1, M23, nr.randn(2,5))
 
     # check_affine(rfft, M35)
     check_affine(convlike, T2357, nr.randn(11,3*5*7), nr.randn(2,11))
+
+    M33 = nr.randn(3,3)
+    check_affine(diag, v3, M33)
+
+    check_affine(inc_vec, M23, v3, nr.randn(2,3))
+    check_affine(inc_row, M23, v13, nr.randn(2,3))
+
+
 
 
     if DISPLAY:
